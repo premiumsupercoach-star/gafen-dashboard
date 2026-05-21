@@ -1,0 +1,6 @@
+streamlit
+facebook-business
+pandas
+plotly
+pytz
+requests
