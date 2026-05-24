@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 import json
 import re
 import pytz
+import requests
 from datetime import datetime, date, timedelta
 from facebook_business.api import FacebookAdsApi
 from facebook_business.adobjects.adaccount import AdAccount
@@ -404,6 +405,48 @@ def fetch_today_summary():
         return spend, int(wa + leads)
     except Exception:
         return 0.0, 0
+
+
+# Ad-set name → topic mapping
+ADSET_TOPIC_MAP = {
+    "גפן | חינוך פיננסי | 2026":          "חינוך פיננסי",
+    "גפן | בינה מלאכותית | 2026":         "בינה מלאכותית",
+    "גפן | ספורט | 2026":                  "ספורט (קפוארה/נינג'ה/לחימה)",
+    "גפן | סדנאות מורים וילדים | 2026":   "סדנאות AI",
+}
+
+
+@st.cache_data(ttl=300)
+def fetch_adset_spend_by_topic():
+    """Fetch spend per ad-set for the last 30 days using the Graph API (requests)."""
+    url = f"https://graph.facebook.com/v20.0/{AD_ACCOUNT_ID}/adsets"
+    params = {
+        "fields": "name,insights.date_preset(last_30d){spend}",
+        "access_token": ACCESS_TOKEN,
+        "limit": 200,
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return {}
+
+    spend_by_topic: dict[str, float] = {}
+    for adset in data.get("data", []):
+        name = adset.get("name", "")
+        topic = None
+        for adset_key, topic_val in ADSET_TOPIC_MAP.items():
+            if adset_key in name:
+                topic = topic_val
+                break
+        if topic is None:
+            continue
+        insights = adset.get("insights", {}).get("data", [])
+        spend = sum(float(row.get("spend", 0)) for row in insights)
+        spend_by_topic[topic] = spend_by_topic.get(topic, 0.0) + spend
+
+    return spend_by_topic
 
 
 def update_adset_budget(adset_id, new_budget_ils):
@@ -1103,6 +1146,83 @@ with tab2:
               <div class="today-lbl">ROI (הכנסות vs הוצאות)</div>
             </div>
             """, unsafe_allow_html=True)
+
+        # ── Zone 5 — עלות ליד לפי נושא ───────────────────────────────────────
+        st.markdown('<div class="section-title">📊 עלות ליד לפי נושא</div>', unsafe_allow_html=True)
+
+        try:
+            spend_by_topic = fetch_adset_spend_by_topic()
+        except Exception:
+            spend_by_topic = {}
+
+        # Count leads per topic from Monday data (exclude irrelevant/closed if desired)
+        topic_lead_counts = (
+            df_leads[df_leads['topic'].notna() & (df_leads['topic'] != '')]
+            .groupby('topic')
+            .size()
+            .to_dict()
+        ) if not df_leads.empty else {}
+
+        # Build unified topic set from both sources
+        all_topics = sorted(set(list(spend_by_topic.keys()) + list(topic_lead_counts.keys())))
+
+        if not all_topics:
+            st.info("אין נתונים לניתוח עלות ליד לפי נושא")
+        else:
+            cpl_rows = []
+            for topic in all_topics:
+                spend = spend_by_topic.get(topic, 0.0)
+                leads_count = topic_lead_counts.get(topic, 0)
+                cpl = spend / leads_count if leads_count > 0 else None
+                cpl_rows.append({
+                    "נושא":         topic,
+                    "הוצאה ₪":     spend,
+                    "לידים":       leads_count,
+                    "עלות/ליד ₪":  cpl,
+                })
+
+            cpl_df = pd.DataFrame(cpl_rows).sort_values("הוצאה ₪", ascending=False)
+
+            # Render styled cards
+            cpl_cols = st.columns(len(cpl_df)) if len(cpl_df) <= 4 else st.columns(2)
+            for idx, (_, r) in enumerate(cpl_df.iterrows()):
+                col = cpl_cols[idx % len(cpl_cols)]
+                cpl_val = f"₪{r['עלות/ליד ₪']:,.0f}" if r['עלות/ליד ₪'] is not None else "—"
+                spend_val = f"₪{r['הוצאה ₪']:,.0f}" if r['הוצאה ₪'] > 0 else "₪0"
+                cpl_color = '#10b981' if (r['עלות/ליד ₪'] or 999) < 80 else ('#f59e0b' if (r['עלות/ליד ₪'] or 999) < 150 else '#ef4444')
+                if r['עלות/ליד ₪'] is None:
+                    cpl_color = 'rgba(255,255,255,0.3)'
+                with col:
+                    st.markdown(f"""
+                    <div style="background:#0f1e35;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:18px;text-align:center;margin-bottom:10px">
+                      <div style="font-size:0.8rem;font-weight:800;color:#E8A020;margin-bottom:12px;direction:rtl">{r['נושא']}</div>
+                      <div style="font-size:1.7rem;font-weight:900;color:{cpl_color};line-height:1">{cpl_val}</div>
+                      <div style="font-size:0.68rem;color:rgba(255,255,255,0.35);margin-top:4px;margin-bottom:10px">עלות ליד</div>
+                      <div style="display:flex;justify-content:space-around;border-top:1px solid rgba(255,255,255,0.06);padding-top:10px">
+                        <div>
+                          <div style="font-size:1rem;font-weight:800;color:#fff">{spend_val}</div>
+                          <div style="font-size:0.65rem;color:rgba(255,255,255,0.35);margin-top:2px">הוצאה</div>
+                        </div>
+                        <div>
+                          <div style="font-size:1rem;font-weight:800;color:#fff">{int(r['לידים'])}</div>
+                          <div style="font-size:0.65rem;color:rgba(255,255,255,0.35);margin-top:2px">לידים</div>
+                        </div>
+                      </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            # Summary table
+            with st.expander("📋 טבלת סיכום — עלות ליד לפי נושא", expanded=False):
+                display_df = cpl_df.copy()
+                display_df["הוצאה ₪"] = display_df["הוצאה ₪"].apply(lambda x: f"₪{x:,.0f}")
+                display_df["עלות/ליד ₪"] = display_df["עלות/ליד ₪"].apply(
+                    lambda x: f"₪{x:,.0f}" if x is not None else "—"
+                )
+                st.dataframe(
+                    display_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
